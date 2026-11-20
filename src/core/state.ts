@@ -113,12 +113,13 @@ export function isoOf(seconds: number): string {
 
 /**
  * The token names exactly one account, but the token itself does not spell its login. The
- * first owner a repository-scoped request addresses is therefore taken as that login, once.
+ * owner under which a client first addresses a repository this account really holds is
+ * therefore taken as that login, once; FORGE_LOGIN settles it up front instead.
  */
-export function adoptOwner(owner: string): void {
-  if (viewer.pinned) return;
+export function adoptOwner(owner: string, repoName: string): void {
+  if (viewer.pinned || !repos.has(repoName.toLowerCase())) return;
   viewer.pinned = true;
-  if (owner !== '' && /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(owner)) viewer.login = owner;
+  if (/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(owner)) viewer.login = owner;
 }
 
 /** The origin requests arrive on, for the absolute URLs in answers. */

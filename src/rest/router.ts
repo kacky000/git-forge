@@ -136,13 +136,14 @@ export function rest(method: string, path: string, search: string, raw: Buffer):
     const head = parts[1];
     if (head === 'repos' && parts.length >= 4) {
       const owner = decode(parts[2]!);
-      adoptOwner(owner);
+      const name = decode(parts[3]!);
+      if (!viewer.pinned) adoptOwner(owner, name);
       // The hot path: reading one issue needs neither the query string nor a body.
       if (method === 'GET' && parts.length === 6 && parts[4] === 'issues') {
-        const repo = needRepo(owner, decode(parts[3]!));
+        const repo = needRepo(owner, name);
         return { status: 200, body: issueBytes(repo, needIssue(repo, parts[5])) };
       }
-      const repo = needRepo(owner, decode(parts[3]!));
+      const repo = needRepo(owner, name);
       const body = parseBody(method, raw);
       return repoRoute(method, repo, parts.slice(4).map(decode), new URLSearchParams(search), body, path);
     }

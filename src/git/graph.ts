@@ -66,6 +66,32 @@ export interface FetchWant {
   shallow: string[];
   /** 0 means no depth limit. */
   depth: number;
+  /** `deepen-relative`: the depth counts from the client's current shallow boundary. */
+  relative?: boolean;
+}
+
+/** How many generations below `tips` the deepest of `marks` sits (0 when none is reachable). */
+function deepestLevel(tips: string[], marks: Set<string>): number {
+  let deepest = 0;
+  let frontier = tips.filter((oid) => getObject(oid)?.type === 'commit');
+  const seen = new Set(frontier);
+  for (let depth = 1; frontier.length > 0; depth += 1) {
+    const next: string[] = [];
+    for (const oid of frontier) {
+      if (marks.has(oid)) {
+        deepest = Math.max(deepest, depth);
+        continue;
+      }
+      for (const parent of commitInfo(oid).parents) {
+        if (!seen.has(parent) && getObject(parent)?.type === 'commit') {
+          seen.add(parent);
+          next.push(parent);
+        }
+      }
+    }
+    frontier = next;
+  }
+  return deepest;
 }
 
 export interface FetchPlan {
@@ -143,6 +169,7 @@ export function planFetch(request: FetchWant): FetchPlan {
     }
   }
   const limited = request.depth > 0;
+  const maxDepth = request.relative === true && limited ? deepestLevel(frontier, clientShallow) + request.depth : request.depth;
   const boundary = new Set<string>();
   const commits: string[] = [];
   while (frontier.length > 0) {
@@ -155,7 +182,7 @@ export function planFetch(request: FetchWant): FetchPlan {
       // limit regardless, because deepening reaches behind commits the client already has.
       if (!limited && !sendIt) continue;
       const parents = commitInfo(oid).parents.filter((parent) => getObject(parent)?.type === 'commit');
-      if (limited && depth >= request.depth) {
+      if (limited && depth >= maxDepth) {
         if (parents.length > 0) boundary.add(oid);
         continue;
       }

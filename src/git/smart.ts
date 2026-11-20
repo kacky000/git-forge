@@ -129,6 +129,7 @@ function fetchArgs(lines: string[], repo: Repo): FetchArgs {
     } else if (line.startsWith('have ')) out.haves.push(line.slice(5, 45).toLowerCase());
     else if (line.startsWith('shallow ')) out.shallow.push(line.slice(8, 48).toLowerCase());
     else if (line.startsWith('deepen ')) out.depth = Math.max(0, Number(line.slice(7)) || 0);
+    else if (line === 'deepen-relative') out.relative = true;
     else if (line === 'done') out.done = true;
   }
   return out;
@@ -140,7 +141,7 @@ const cloneCache = new Map<string, Buffer>();
 function fetchV2(repo: Repo, lines: string[]): Buffer {
   const args = fetchArgs(lines, repo);
   const cacheable = args.haves.length === 0;
-  const key = cacheable ? `${args.wants.join(',')}|${args.shallow.join(',')}|${args.depth}|${args.done ? 1 : 0}` : '';
+  const key = cacheable ? `${args.wants.join(',')}|${args.shallow.join(',')}|${args.depth}${args.relative === true ? 'r' : ''}|${args.done ? 1 : 0}` : '';
   if (cacheable) {
     const hit = cloneCache.get(key);
     if (hit !== undefined) return hit;

@@ -155,7 +155,7 @@ function dispatch(req: IncomingMessage, res: ServerResponse, body: Buffer): void
   if (git !== null) {
     const owner = decodeURIComponent(git[1]!);
     const name = decodeURIComponent(git[2]!);
-    adoptOwner(owner);
+    adoptOwner(owner, name);
     const what = git[3]!;
     if (what === 'info/refs' && (method === 'GET' || method === 'HEAD')) {
       const proto = req.headers['git-protocol'];
