@@ -208,7 +208,7 @@ export function uploadPack(owner: string, name: string, body: Buffer): GitReply 
     return plain(400, `bad request: ${err instanceof Error ? err.message : 'malformed pkt-line'}\n`);
   }
   const first = packets.find((packet) => packet.kind === 'data');
-  if (first === undefined || first.kind !== 'data') return plain(400, 'bad request: empty upload-pack request\n');
+  if (first === undefined || first.kind !== 'data') return { status: 200, type, body: Buffer.alloc(0) };
   try {
     if (first.text.startsWith('command=')) {
       const command = first.text.slice(8).trim();
@@ -277,7 +277,8 @@ export function receivePack(owner: string, name: string, body: Buffer): GitReply
   } catch (err) {
     return plain(400, `bad request: ${err instanceof Error ? err.message : 'malformed pkt-line'}\n`);
   }
-  if (commands.length === 0) return plain(400, 'bad request: no ref commands\n');
+  // A lone flush packet is git's probe before a large (chunked) push: accept it and say nothing.
+  if (commands.length === 0) return { status: 200, type, body: Buffer.alloc(0) };
 
   let unpack = 'ok';
   if (rest < body.length) {

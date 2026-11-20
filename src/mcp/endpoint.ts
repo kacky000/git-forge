@@ -4,7 +4,6 @@
 // 2026-07-28 clients, and `initialize` + `notifications/initialized` for earlier ones. No
 // session is kept, so every request stands on its own.
 
-import type { IncomingHttpHeaders } from 'node:http';
 import { ApiError, isObject, type Json } from '../core/errors.ts';
 import { TOOLS, TOOL_BY_NAME } from './tools.ts';
 
@@ -122,7 +121,7 @@ function answer(message: unknown): Json | null {
   }
 }
 
-export function mcp(method: string, raw: Buffer, headers: IncomingHttpHeaders): McpReply {
+export function mcp(method: string, raw: Buffer, headers: Record<string, string | undefined>): McpReply {
   const base: Record<string, string> = { 'MCP-Protocol-Version': LATEST };
   const asked = headers['mcp-protocol-version'];
   if (typeof asked === 'string' && VERSIONS.includes(asked)) base['MCP-Protocol-Version'] = asked;
