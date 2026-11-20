@@ -39,7 +39,8 @@ git -c http.extraHeader="Authorization: Bearer secret" clone http://127.0.0.1:87
 ## Layout
 
 - `main.ts`: process lifecycle (bind, register, wait, exit).
-- `app.ts`: the HTTP server: authentication, body reading and routing to a surface.
+- `app.ts`: the front door: authentication and routing to a surface.
+- `src/http/`: a small HTTP/1.1 server on `node:net` that frames requests and writes each reply in one socket write.
 - `src/git/`: the object database, packfiles, pkt-lines, commit-graph walks, tree editing and merging, and the smart HTTP services.
 - `src/core/`: the store and the services every surface shares (repositories, contents, issues, pull requests).
 - `src/rest/`, `src/graphql/`, `src/mcp/`: the three API surfaces over those services.

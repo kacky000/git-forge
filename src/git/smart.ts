@@ -241,9 +241,9 @@ interface RefCommand {
 /** Why a command is refused, or null when it may be applied. */
 function refusal(repo: Repo, command: RefCommand): string | null {
   if (!command.ref.startsWith('refs/') || /[\s~^:?*[\\]|\.\.|\/\/|\/$|@\{/.test(command.ref)) return 'funny refname';
-  const current = repo.refs.get(command.ref);
-  if (command.to === ZERO) return current === undefined ? null : null;
+  if (command.to === ZERO) return null;
   if (!hasObject(command.to)) return 'missing necessary objects';
+  const current = repo.refs.get(command.ref);
   if (current === undefined || current === command.to) return null;
   const from = peelToCommit(current);
   const to = peelToCommit(command.to);

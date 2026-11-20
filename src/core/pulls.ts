@@ -210,11 +210,3 @@ export function mergePull(repo: Repo, issue: Issue, input: Json): MergeResult {
   setIssueState(issue, 'closed', null);
   return { sha, merged: true, message: 'Pull Request successfully merged' };
 }
-
-export function needPullOr404(repo: Repo, number: unknown): Issue {
-  try {
-    return needPull(repo, number);
-  } catch {
-    throw notFound();
-  }
-}
