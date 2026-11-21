@@ -437,9 +437,15 @@ function readAhead(socket: Socket, feed: (chunk: Buffer) => void): void {
   const traceLimit = Error.stackTraceLimit;
   Error.stackTraceLimit = 0;
   try {
+    // A client that alternates between connections sends its next request on another one
+    // than the last, so each round starts after the connection that spoke last.
+    let first = 0;
     for (;;) {
       let got = false;
-      for (const talker of talkers) {
+      const count0 = talkers.length;
+      for (let step = 0; step < count0; step += 1) {
+        const at = (first + step) % count0;
+        const talker = talkers[at]!;
         const fd = descriptorOf(talker.socket);
         if (fd < 0) {
           // A connection that is closing leaves the set; the event loop finishes it.
@@ -467,6 +473,8 @@ function readAhead(socket: Socket, feed: (chunk: Buffer) => void): void {
         directBuffer.copy(chunk, 0, 0, count);
         talker.feed(chunk);
         got = true;
+        first = (at + 1) % count0;
+        break;
       }
       const now = performance.now();
       if (now > sliceEnd) return;
