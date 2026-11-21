@@ -21,6 +21,12 @@ export interface HttpReply {
   /** Complete header lines, each ending in CRLF (Content-Length and Date are added here). */
   headers: string;
   body: Buffer | null;
+  /**
+   * True when handling the request changed nothing and the reply depends only on the request's
+   * bytes and the forge's state: such a reply may answer the same bytes again until a request
+   * without this mark arrives.
+   */
+  pure?: boolean;
 }
 
 export type HttpHandler = (request: HttpRequest) => HttpReply;
@@ -55,9 +61,24 @@ const MAX_BODY = 512 * 1024 * 1024;
 /** Replies up to this size are copied next to their headers and sent as one buffer. */
 const ONE_WRITE = 64 * 1024;
 
+/** Requests longer than this are never looked up in, or added to, the reply cache. */
+const CACHE_REQUEST_MAX = 4096;
+/** Replies longer than this are never kept in the reply cache. */
+const CACHE_REPLY_MAX = 1024 * 1024;
+const CACHE_ENTRIES_MAX = 512;
+
+/**
+ * Whole replies, as written to the socket, by the exact bytes of the request they answered.
+ * Only replies the handler marked `pure` are kept, and the first request that is not pure
+ * empties the cache, so a hit is always what the handler would have answered. The Date header
+ * is part of a cached reply, so the cache also empties when the second changes.
+ */
+const replyCache = new Map<string, Buffer>();
+
 let dateLine = `Date: ${new Date().toUTCString()}\r\n`;
 setInterval(() => {
   dateLine = `Date: ${new Date().toUTCString()}\r\n`;
+  if (replyCache.size > 0) replyCache.clear();
 }, 1000).unref();
 
 /** How long after a request the event loop keeps polling without sleeping. */
@@ -99,16 +120,48 @@ interface Head {
 /** Parse the request line and headers that end at `end`; null when they are not HTTP. */
 function parseHead(buf: Buffer, start: number, end: number): Head | null {
   const text = buf.latin1Slice(start, end);
-  let lineEnd = text.indexOf('\r\n');
+  const lineEnd = text.indexOf('\r\n');
   const first = lineEnd < 0 ? text : text.slice(0, lineEnd);
   const sp1 = first.indexOf(' ');
   const sp2 = first.lastIndexOf(' ');
   if (sp1 <= 0 || sp2 <= sp1 || !first.startsWith('HTTP/1.', sp2 + 1)) return null;
+  // One client sends the same header lines with every request, so a block seen before is
+  // not parsed again. The parsed headers are shared between requests and never modified.
+  const block = lineEnd < 0 ? '' : text.slice(lineEnd + 2);
+  let fields = fieldCache.get(block);
+  if (fields === undefined) {
+    const parsed = parseFields(block);
+    if (parsed === null) return null;
+    if (fieldCache.size >= FIELD_CACHE_MAX) fieldCache.clear();
+    fieldCache.set(block, parsed);
+    fields = parsed;
+  }
+  const close = first.endsWith('HTTP/1.0') ? !fields.keepAlive : fields.close;
+  return { method: first.slice(0, sp1), url: first.slice(sp1 + 1, sp2), headers: fields.headers, bodyStart: end + 4, length: fields.length, close };
+}
+
+interface Fields {
+  headers: Record<string, string>;
+  /** Content-Length, or -1 for a chunked body. */
+  length: number;
+  /** The Connection header asks to close. */
+  close: boolean;
+  /** The Connection header asks to keep the connection (what HTTP/1.0 needs). */
+  keepAlive: boolean;
+}
+
+const FIELD_CACHE_MAX = 2048;
+const fieldCache = new Map<string, Fields>();
+
+/** Parse the header lines of a request (everything after the request line); null when malformed. */
+function parseFields(block: string): Fields | null {
   const headers: Record<string, string> = {};
-  while (lineEnd >= 0) {
-    const from = lineEnd + 2;
-    lineEnd = text.indexOf('\r\n', from);
-    const line = lineEnd < 0 ? text.slice(from) : text.slice(from, lineEnd);
+  let from = 0;
+  while (from < block.length) {
+    let lineEnd = block.indexOf('\r\n', from);
+    if (lineEnd < 0) lineEnd = block.length;
+    const line = block.slice(from, lineEnd);
+    from = lineEnd + 2;
     const colon = line.indexOf(':');
     if (colon <= 0) continue;
     const name = line.slice(0, colon).toLowerCase();
@@ -124,8 +177,12 @@ function parseHead(buf: Buffer, start: number, end: number): Head | null {
     if (!Number.isSafeInteger(length) || length < 0) return null;
   }
   const connection = headers.connection;
-  const close = first.endsWith('HTTP/1.0') ? !(connection !== undefined && /keep-alive/i.test(connection)) : connection !== undefined && /close/i.test(connection);
-  return { method: first.slice(0, sp1), url: first.slice(sp1 + 1, sp2), headers, bodyStart: end + 4, length, close };
+  return {
+    headers,
+    length,
+    close: connection !== undefined && /close/i.test(connection),
+    keepAlive: connection !== undefined && /keep-alive/i.test(connection),
+  };
 }
 
 /** Decode a chunked body starting at `start`; null while it is still incomplete. */
@@ -154,16 +211,25 @@ function readChunked(buf: Buffer, start: number): { body: Buffer; next: number }
   }
 }
 
-function write(socket: Socket, reply: HttpReply, headOnly: boolean, close: boolean): void {
+/**
+ * Send a reply. With `keep`, the reply is always built as one buffer and returned, so the
+ * caller can send the same bytes again; otherwise a large body is written after its headers
+ * without being copied and nothing is returned.
+ */
+function write(socket: Socket, reply: HttpReply, headOnly: boolean, close: boolean, keep: boolean): Buffer | null {
   const body = reply.body;
   const size = body === null ? 0 : body.length;
   let head = `HTTP/1.1 ${reply.status} ${REASONS[reply.status] ?? 'Status'}\r\n${reply.headers}`;
   if (reply.status !== 204 && reply.status !== 304) head += `Content-Length: ${size}\r\n`;
   head += close ? `${dateLine}Connection: close\r\n\r\n` : `${dateLine}\r\n`;
+  let out: Buffer | null = null;
   if (body === null || size === 0 || headOnly) {
-    socket.write(head, 'latin1');
-  } else if (size <= ONE_WRITE) {
-    const out = Buffer.allocUnsafe(head.length + size);
+    if (keep) {
+      out = Buffer.from(head, 'latin1');
+      socket.write(out);
+    } else socket.write(head, 'latin1');
+  } else if (size <= ONE_WRITE || keep) {
+    out = Buffer.allocUnsafe(head.length + size);
     out.latin1Write(head, 0);
     body.copy(out, head.length);
     socket.write(out);
@@ -174,11 +240,12 @@ function write(socket: Socket, reply: HttpReply, headOnly: boolean, close: boole
     socket.uncork();
   }
   if (close) socket.end();
+  return out;
 }
 
 function refuse(socket: Socket, status: number): void {
   const body = Buffer.from(JSON.stringify({ message: REASONS[status] ?? 'Bad Request' }), 'utf8');
-  write(socket, { status, headers: 'Content-Type: application/json; charset=utf-8\r\n', body }, false, true);
+  write(socket, { status, headers: 'Content-Type: application/json; charset=utf-8\r\n', body }, false, true, false);
 }
 
 function serve(socket: Socket, handler: HttpHandler): void {
@@ -190,6 +257,17 @@ function serve(socket: Socket, handler: HttpHandler): void {
   let needed = 0;
 
   socket.on('data', (chunk: Buffer) => {
+    // A read that is, byte for byte, a request already answered purely gets the same reply.
+    let key = '';
+    if (held === 0 && chunk.length <= CACHE_REQUEST_MAX) {
+      key = chunk.latin1Slice(0, chunk.length);
+      const hit = replyCache.get(key);
+      if (hit !== undefined) {
+        socket.write(hit);
+        touch();
+        return;
+      }
+    }
     chunks.push(chunk);
     held += chunk.length;
     if (held < needed) return;
@@ -239,7 +317,18 @@ function serve(socket: Socket, handler: HttpHandler): void {
           process.stderr.write(`[forge] request failed: ${err instanceof Error ? err.stack ?? err.message : String(err)}\n`);
           reply = { status: 500, headers: 'Content-Type: application/json; charset=utf-8\r\n', body: Buffer.from('{"message":"Server Error"}', 'utf8') };
         }
-        write(socket, reply, request.method === 'HEAD', request.close);
+        if (reply.pure === true) {
+          // Cacheable only when this read held exactly this one request and nothing else.
+          const keep = key !== '' && pos === 0 && next === buf.length && !request.close && request.headers.expect === undefined;
+          const sent = write(socket, reply, request.method === 'HEAD', request.close, keep);
+          if (keep && sent !== null && sent.length <= CACHE_REPLY_MAX) {
+            if (replyCache.size >= CACHE_ENTRIES_MAX) replyCache.clear();
+            replyCache.set(key, sent);
+          }
+        } else {
+          if (replyCache.size > 0) replyCache.clear();
+          write(socket, reply, request.method === 'HEAD', request.close, false);
+        }
         touch();
         pos = next;
         if (request.close) return;

@@ -21,7 +21,7 @@ import { mcp } from './src/mcp/endpoint.ts';
 const TOKEN = process.env.MAKEFUN_SHOP_TOKEN ?? '';
 const BEARER = `Bearer ${TOKEN}`;
 const JSON_HEAD = 'Content-Type: application/json; charset=utf-8\r\nX-OAuth-Scopes: repo, read:org\r\nX-GitHub-Media-Type: github.v3; format=json\r\nX-GitHub-Request-Id: ';
-const HEALTH: HttpReply = { status: 200, headers: 'Content-Type: application/json; charset=utf-8\r\n', body: Buffer.from('{"ok":true}', 'utf8') };
+const HEALTH: HttpReply = { status: 200, headers: 'Content-Type: application/json; charset=utf-8\r\n', body: Buffer.from('{"ok":true}', 'utf8'), pure: true };
 
 let served = 0;
 let lastHost = '';
@@ -105,18 +105,25 @@ function respond(request: HttpRequest): HttpReply {
   const path = mark < 0 ? url : url.slice(0, mark);
   const credentials = request.headers.authorization;
   if (!authorized(credentials)) {
-    return message(401, credentials === undefined ? 'Requires authentication' : 'Bad credentials', GIT_PATH.test(path) ? 'WWW-Authenticate: Basic realm="git-forge"\r\n' : '');
+    const refused = message(401, credentials === undefined ? 'Requires authentication' : 'Bad credentials', GIT_PATH.test(path) ? 'WWW-Authenticate: Basic realm="git-forge"\r\n' : '');
+    refused.pure = true;
+    return refused;
   }
   const search = mark < 0 ? '' : url.slice(mark + 1);
   const method = request.method;
   const body = decoded(request);
   if (body === null) return message(400, 'The request body could not be decoded');
+  // A read changes nothing once the viewer is settled (until then a read may adopt an owner),
+  // so its reply may be reused for the same request while no write arrives.
+  const reads = viewer.pinned && (method === 'GET' || method === 'HEAD');
 
   if (path.startsWith('/api/v3')) {
     const tail = path.slice(7);
     if (tail === '' || tail.charCodeAt(0) === 47) {
       const reply = rest(method === 'HEAD' ? 'GET' : method, tail, search, body);
-      return jsonReply(reply.status, reply.body, reply.link);
+      const out = jsonReply(reply.status, reply.body, reply.link);
+      if (reads) out.pure = true;
+      return out;
     }
   }
   if (path === '/api/graphql') {
@@ -135,12 +142,20 @@ function respond(request: HttpRequest): HttpReply {
   if (git !== null) {
     const owner = safeDecode(git[1]!);
     const name = safeDecode(git[2]!);
-    if (!viewer.pinned) adoptOwner(owner, name);
+    const settled = viewer.pinned;
+    if (!settled) adoptOwner(owner, name);
     const what = git[3]!;
     if (what === 'info/refs' && (method === 'GET' || method === 'HEAD')) {
-      return gitReply(infoRefs(owner, name, new URLSearchParams(search).get('service'), request.headers['git-protocol']));
+      const out = gitReply(infoRefs(owner, name, new URLSearchParams(search).get('service'), request.headers['git-protocol']));
+      if (settled) out.pure = true;
+      return out;
     }
-    if (what === 'git-upload-pack' && method === 'POST') return gitReply(uploadPack(owner, name, body));
+    if (what === 'git-upload-pack' && method === 'POST') {
+      // A fetch only reads the repository, whatever it asks for.
+      const out = gitReply(uploadPack(owner, name, body));
+      if (settled) out.pure = true;
+      return out;
+    }
     if (what === 'git-receive-pack' && method === 'POST') return gitReply(receivePack(owner, name, body));
   }
   return message(404, 'Not Found');

@@ -2,7 +2,7 @@
 // writing the packs a fetch answers with.
 
 import { createHash } from 'node:crypto';
-import { inflateSync } from 'node:zlib';
+import { constants, createInflate, inflateSync } from 'node:zlib';
 import { deflated, getObject, needObject, putObject, type ObjType } from './objects.ts';
 
 const TYPE_BY_CODE: Record<number, ObjType> = { 1: 'commit', 2: 'tree', 3: 'blob', 4: 'tag' };
@@ -22,8 +22,70 @@ interface Pending {
   baseOid?: string;
 }
 
-/** Inflate the zlib stream that starts at `pos`; `used` is how many packed bytes it occupied. */
-function inflateAt(pack: Buffer, pos: number): { data: Buffer; used: number } {
+/** The parts of a zlib stream object that one synchronous, whole-buffer inflate needs. */
+interface InflateEngine {
+  _handle: {
+    writeSync(flush: number, input: Buffer, inOffset: number, inLength: number, output: Buffer, outOffset: number, outLength: number): void;
+    reset(): void;
+  } | null;
+  /** After a write: [output bytes still free, input bytes not consumed]. */
+  _writeState: Uint32Array;
+  destroyed: boolean;
+  on(event: 'error', listener: () => void): unknown;
+}
+
+let engine: InflateEngine | null = null;
+/** Set once the runtime's zlib object turns out not to have the shape `quickInflate` relies on. */
+let engineUnusable = false;
+
+/**
+ * Inflate one pack entry whose inflated size the entry header already told us, on one inflater
+ * that is reset and reused. `inflateSync` builds and tears down a zlib object for every call,
+ * which costs more than inflating a small object does; a push carries a few small objects, so
+ * that set-up is most of the work. Returns null whenever anything is not exactly as expected
+ * (a different runtime, a damaged or oversized stream), and the caller then uses `inflateSync`.
+ */
+function quickInflate(pack: Buffer, pos: number, size: number): { data: Buffer; used: number } | null {
+  if (engineUnusable) return null;
+  try {
+    if (engine === null || engine.destroyed || engine._handle === null) {
+      const made = createInflate() as unknown as InflateEngine;
+      made.on('error', () => undefined);
+      const handle = made._handle;
+      if (handle === null || typeof handle.writeSync !== 'function' || typeof handle.reset !== 'function' || !(made._writeState instanceof Uint32Array)) {
+        engineUnusable = true;
+        return null;
+      }
+      engine = made;
+    }
+    const handle = engine._handle!;
+    const state = engine._writeState;
+    const available = pack.length - pos;
+    // One spare byte of output shows a stream that inflates to more than its header declared.
+    const out = Buffer.allocUnsafe(size + 1);
+    handle.writeSync(constants.Z_FINISH, pack, pos, available, out, 0, size + 1);
+    if (engine.destroyed || engine._handle === null) {
+      engine = null;
+      return null;
+    }
+    const produced = size + 1 - (state[0] as number);
+    const used = available - (state[1] as number);
+    handle.reset();
+    if (produced !== size || used <= 0 || used > available) return null;
+    return { data: out.subarray(0, size), used };
+  } catch {
+    engine = null;
+    return null;
+  }
+}
+
+/**
+ * Inflate the zlib stream that starts at `pos`; `used` is how many packed bytes it occupied.
+ * `size` is the inflated size the entry header declares.
+ */
+function inflateAt(pack: Buffer, pos: number, size: number): { data: Buffer; used: number } {
+  const quick = quickInflate(pack, pos, size);
+  if (quick !== null) return quick;
   const out = inflateSync(pack.subarray(pos), { info: true }) as unknown as { buffer: Buffer; engine: { bytesWritten: number } };
   return { data: out.buffer, used: out.engine.bytesWritten };
 }
@@ -93,7 +155,14 @@ export function ingestPack(pack: Buffer): string[] {
     const offset = pos;
     let byte = pack[pos++] as number;
     const code = (byte >> 4) & 7;
-    while ((byte & 0x80) !== 0) byte = pack[pos++] as number;
+    // The entry header's size: 4 bits, then 7 bits a byte, least significant first.
+    let size = byte & 0x0f;
+    let scale = 16;
+    while ((byte & 0x80) !== 0) {
+      byte = pack[pos++] as number;
+      size += (byte & 0x7f) * scale;
+      scale *= 128;
+    }
     if (code === OFS_DELTA) {
       byte = pack[pos++] as number;
       let back = byte & 0x7f;
@@ -101,19 +170,19 @@ export function ingestPack(pack: Buffer): string[] {
         byte = pack[pos++] as number;
         back = (back + 1) * 128 + (byte & 0x7f);
       }
-      const { data, used } = inflateAt(pack, pos);
+      const { data, used } = inflateAt(pack, pos, size);
       pos += used;
       pending.push({ offset, delta: data, baseOffset: offset - back });
     } else if (code === REF_DELTA) {
       const baseOid = pack.toString('hex', pos, pos + 20);
       pos += 20;
-      const { data, used } = inflateAt(pack, pos);
+      const { data, used } = inflateAt(pack, pos, size);
       pos += used;
       pending.push({ offset, delta: data, baseOid });
     } else {
       const type = TYPE_BY_CODE[code];
       if (type === undefined) throw new Error(`unknown pack object type ${code}`);
-      const { data, used } = inflateAt(pack, pos);
+      const { data, used } = inflateAt(pack, pos, size);
       const z = pack.subarray(pos, pos + used);
       pos += used;
       byOffset.set(offset, { type, data });
