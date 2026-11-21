@@ -3,7 +3,7 @@
 // Objects are content addressed, so one map serves every repository: a repository is only a set
 // of refs pointing into it. Parsed views (commit headers, tree entries) are cached on the object.
 
-import { createHash } from 'node:crypto';
+import crypto, { createHash } from 'node:crypto';
 import { deflateSync } from 'node:zlib';
 
 export type ObjType = 'commit' | 'tree' | 'blob' | 'tag';
@@ -45,7 +45,19 @@ export const EMPTY_TREE = '4b825dc642cb6eb9a060e54bf8d69288fbee4904';
 
 const db = new Map<string, GitObj>();
 
+/** `crypto.hash`, the one-call digest newer Node 22 releases have: no hash object to set up. */
+const oneShot = (crypto as { hash?: (algorithm: string, data: Buffer, encoding: 'hex') => string }).hash;
+/** Objects up to this size are hashed in one call, from one buffer holding header and content. */
+const ONE_SHOT_MAX = 32 * 1024;
+
 export function hashOf(type: ObjType, data: Buffer): string {
+  if (oneShot !== undefined && data.length <= ONE_SHOT_MAX) {
+    const head = `${type} ${data.length}\0`;
+    const whole = Buffer.allocUnsafe(head.length + data.length);
+    whole.latin1Write(head, 0);
+    data.copy(whole, head.length);
+    return oneShot('sha1', whole, 'hex');
+  }
   const h = createHash('sha1');
   h.update(`${type} ${data.length}\0`);
   h.update(data);
