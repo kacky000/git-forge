@@ -5,6 +5,7 @@
 // the reply in a single socket write, keep the connection open. Doing exactly that, and no
 // more, makes a request round trip markedly cheaper than going through node:http's streams.
 
+import { readSync } from 'node:fs';
 import { createServer, type Server, type Socket } from 'node:net';
 
 export interface HttpRequest {
@@ -256,7 +257,8 @@ function serve(socket: Socket, handler: HttpHandler): void {
   /** Bytes the buffer must hold before the pending request is complete (0: unknown). */
   let needed = 0;
 
-  socket.on('data', (chunk: Buffer) => {
+  /** Take the next bytes of the connection: answer every request they complete. */
+  const feed = (chunk: Buffer): void => {
     // A read that is, byte for byte, a request already answered purely gets the same reply.
     let key = '';
     if (held === 0 && chunk.length <= CACHE_REQUEST_MAX) {
@@ -352,8 +354,128 @@ function serve(socket: Socket, handler: HttpHandler): void {
       head.bodyStart -= pos;
       needed = head.length < 0 ? 0 : head.bodyStart + head.length;
     } else needed = 0;
+  };
+  socket.on('data', (chunk: Buffer) => {
+    feed(chunk);
+    if (directReads) readAhead(socket, feed);
   });
   socket.on('error', () => socket.destroy());
+}
+
+/** How long a run of direct reads waits for the next request before giving up. */
+const DIRECT_WAIT_MS = 4;
+/** The longest one run of direct reads keeps the event loop from turning. */
+const DIRECT_SLICE_MS = 12;
+/** The talking connections must have been the same ones for this long before they are read directly. */
+const DIRECT_SETTLE_MS = 50;
+/** The most connections one run of direct reads watches. */
+const TALKERS_MAX = 3;
+/**
+ * Direct reads need a connection's file descriptor, which only POSIX systems expose; they are
+ * tried on Linux alone (FORGE_DIRECT_READS=0 turns them off) and stop for good at the first
+ * surprise.
+ */
+let directReads = process.platform === 'linux' && process.env.FORGE_DIRECT_READS !== '0';
+const directBuffer = Buffer.allocUnsafe(64 * 1024);
+
+interface Talker {
+  socket: Socket;
+  feed: (chunk: Buffer) => void;
+}
+
+/** The connections that sent the latest requests, and when that set last changed. */
+let talkers: Talker[] = [];
+let talkersSince = 0;
+
+/** The descriptor of an open connection; -1 once it is closed or where there is none to see. */
+function descriptorOf(socket: Socket): number {
+  if (socket.destroyed || socket.readableEnded || !socket.writable) return -1;
+  const handle = (socket as unknown as { _handle?: { fd?: unknown } | null })._handle;
+  if (handle === undefined || handle === null) return -1;
+  const fd = handle.fd;
+  return typeof fd === 'number' && fd >= 0 ? fd : -1;
+}
+
+function dropTalker(gone: Talker): void {
+  talkers = talkers.filter((other) => other !== gone);
+  talkersSince = performance.now();
+}
+
+/**
+ * When one client talks to the forge alone, sending each request as soon as it has the reply
+ * to the one before, the next request is on its way the moment a reply is written. (Such a
+ * client may still alternate between two or three kept-alive connections.) Instead of going
+ * back to the event loop (a poll, a read, the stream's own bookkeeping), read those
+ * connections' descriptors directly for a short while and hand what arrives to the same
+ * `feed`. The descriptors are non-blocking, so an empty read fails at once with EAGAIN and is
+ * tried again; the run ends when nothing arrives for DIRECT_WAIT_MS or after DIRECT_SLICE_MS,
+ * so timers and other connections are never kept waiting longer than that. Bytes not taken
+ * here are delivered by the event loop as usual, in order, to the same `feed`. With more
+ * connections talking than TALKERS_MAX (many clients at once) nothing is read directly.
+ * A descriptor is looked up afresh before every read and only on a connection that is still
+ * open, so a number the system has given to another connection is never read by mistake.
+ */
+function readAhead(socket: Socket, feed: (chunk: Buffer) => void): void {
+  const started = performance.now();
+  let known = false;
+  for (const talker of talkers) if (talker.socket === socket) known = true;
+  if (!known) {
+    if (descriptorOf(socket) < 0) {
+      directReads = false;
+      return;
+    }
+    // A new voice: start over with it alone when the set is full, and let the set settle.
+    if (talkers.length >= TALKERS_MAX) talkers = [];
+    talkers.push({ socket, feed });
+    talkersSince = started;
+    return;
+  }
+  if (started - talkersSince < DIRECT_SETTLE_MS) return;
+  const sliceEnd = started + DIRECT_SLICE_MS;
+  let idleEnd = started + DIRECT_WAIT_MS;
+  // An empty read throws; without this the runtime would record a stack trace for each one.
+  const traceLimit = Error.stackTraceLimit;
+  Error.stackTraceLimit = 0;
+  try {
+    for (;;) {
+      let got = false;
+      for (const talker of talkers) {
+        const fd = descriptorOf(talker.socket);
+        if (fd < 0) {
+          // A connection that is closing leaves the set; the event loop finishes it.
+          dropTalker(talker);
+          return;
+        }
+        let count: number;
+        try {
+          count = readSync(fd, directBuffer, 0, directBuffer.length, null);
+        } catch (err) {
+          const code = (err as { code?: unknown }).code;
+          if (code === 'EAGAIN' || code === 'EWOULDBLOCK') continue;
+          // A reset or closed connection is the event loop's to report; anything else is a
+          // sign that direct reads do not work here.
+          if (code !== 'ECONNRESET' && code !== 'EPIPE' && code !== 'ENOTCONN' && code !== 'EBADF') directReads = false;
+          dropTalker(talker);
+          return;
+        }
+        // End of stream: the event loop sees the same and closes the connection.
+        if (count <= 0) {
+          dropTalker(talker);
+          return;
+        }
+        const chunk = Buffer.allocUnsafe(count);
+        directBuffer.copy(chunk, 0, 0, count);
+        talker.feed(chunk);
+        got = true;
+      }
+      const now = performance.now();
+      if (now > sliceEnd) return;
+      if (got) idleEnd = now + DIRECT_WAIT_MS;
+      else if (now > idleEnd) return;
+    }
+  } finally {
+    Error.stackTraceLimit = traceLimit;
+  }
 }
 
 /** Build the server; the caller decides where it listens. */
