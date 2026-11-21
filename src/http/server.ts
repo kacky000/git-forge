@@ -60,6 +60,31 @@ setInterval(() => {
   dateLine = `Date: ${new Date().toUTCString()}\r\n`;
 }, 1000).unref();
 
+/** How long after a request the event loop keeps polling without sleeping. */
+const HOT_MS = 25;
+let hotUntil = 0;
+let hot = false;
+
+function stayHot(): void {
+  if (performance.now() < hotUntil) setImmediate(stayHot);
+  else hot = false;
+}
+
+/**
+ * A client that sends its requests one after another waits for each reply before it sends the
+ * next, so the gap between two requests is short and the server would otherwise go to sleep in
+ * the kernel and be woken again every time. While requests keep arriving, a pending immediate
+ * keeps the loop turning with a zero poll timeout, so the next request is picked up at once;
+ * HOT_MS after the last request the loop goes back to sleeping.
+ */
+function touch(): void {
+  hotUntil = performance.now() + HOT_MS;
+  if (!hot) {
+    hot = true;
+    setImmediate(stayHot);
+  }
+}
+
 interface Head {
   method: string;
   url: string;
@@ -215,6 +240,7 @@ function serve(socket: Socket, handler: HttpHandler): void {
           reply = { status: 500, headers: 'Content-Type: application/json; charset=utf-8\r\n', body: Buffer.from('{"message":"Server Error"}', 'utf8') };
         }
         write(socket, reply, request.method === 'HEAD', request.close);
+        touch();
         pos = next;
         if (request.close) return;
         if (pos >= buf.length) break;
